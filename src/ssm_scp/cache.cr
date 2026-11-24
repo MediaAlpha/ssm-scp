@@ -9,12 +9,14 @@ module SsmScp
 
     # "name::region" (the scp-ssm format) without a profile, so that file stays
     # compatible; "name::region::profile" when an AWS profile is set, because
-    # another account can have the same Name tag.
-    def self.key(name : String, region : String, profile : String? = nil) : String
-      profile ? "#{name}::#{region}::#{profile}" : "#{name}::#{region}"
+    # another account can have the same Name tag.  Without a region the part
+    # is the literal "default" (the aws CLI picks the region itself).
+    def self.key(name : String, region : String?, profile : String? = nil) : String
+      reg = region || "default"
+      profile ? "#{name}::#{reg}::#{profile}" : "#{name}::#{reg}"
     end
 
-    def lookup(name : String, region : String, profile : String? = nil, now : Time = Time.utc) : String?
+    def lookup(name : String, region : String?, profile : String? = nil, now : Time = Time.utc) : String?
       return unless File.exists?(@path)
       entries = JSON.parse(File.read(@path))
       entry = entries[self.class.key(name, region, profile)]? || return
@@ -25,7 +27,7 @@ module SsmScp
     end
 
     # Also drops expired entries, so the file does not grow forever.
-    def store(name : String, region : String, id : String, profile : String? = nil, now : Time = Time.utc) : Nil
+    def store(name : String, region : String?, id : String, profile : String? = nil, now : Time = Time.utc) : Nil
       entries = load_entries
       entries.reject! { |_, entry| expired?(entry, now) }
       entries[self.class.key(name, region, profile)] = JSON.parse({"id" => id, "at" => now.to_rfc3339}.to_json)
@@ -35,7 +37,7 @@ module SsmScp
     end
 
     # Removes one entry (e.g. an instance id that turned out to be stale).
-    def evict(name : String, region : String, profile : String? = nil) : Nil
+    def evict(name : String, region : String?, profile : String? = nil) : Nil
       return unless File.exists?(@path)
       entries = load_entries
       return unless entries.delete(self.class.key(name, region, profile))

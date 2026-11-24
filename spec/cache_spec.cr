@@ -33,6 +33,24 @@ describe SsmScp::ResolveCache do
     SsmScp::ResolveCache.key("web", "us-east-1").should eq "web::us-east-1"
   end
 
+  it "uses the literal \"default\" without a region" do
+    SsmScp::ResolveCache.key("web", nil).should eq "web::default"
+    SsmScp::ResolveCache.key("web", nil, "prod").should eq "web::default::prod"
+  end
+
+  it "stores and looks up an entry without a region, apart from a regional one" do
+    with_tmp_dir do |dir|
+      cache = SsmScp::ResolveCache.new(dir / "resolve.json")
+      cache.store("web", nil, "i-d", now: now)
+      cache.store("web", "us-east-1", "i-r", now: now)
+      cache.lookup("web", nil, now: now).should eq "i-d"
+      cache.lookup("web", "us-east-1", now: now).should eq "i-r"
+      cache.evict("web", nil)
+      cache.lookup("web", nil, now: now).should be_nil
+      cache.lookup("web", "us-east-1", now: now).should eq "i-r"
+    end
+  end
+
   it "includes the AWS profile in the key when one is set" do
     SsmScp::ResolveCache.key("web", "us-east-1", "prod").should eq "web::us-east-1::prod"
     SsmScp::ResolveCache.key("web", "us-east-1", nil).should eq "web::us-east-1"

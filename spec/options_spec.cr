@@ -16,12 +16,15 @@ describe SsmScp::Options do
       o.rest.should eq ["i-1:/a", "/b"]
     end
 
-    it "default_region follows AWS_REGION, AWS_DEFAULT_REGION, then us-east-1" do
+    it "default_region follows AWS_REGION, then AWS_DEFAULT_REGION, else nil (no forced region)" do
       saved = {ENV["AWS_REGION"]?, ENV["AWS_DEFAULT_REGION"]?}
       begin
         ENV.delete("AWS_REGION")
         ENV.delete("AWS_DEFAULT_REGION")
-        SsmScp::Options.default_region.should eq "us-east-1"
+        SsmScp::Options.default_region.should be_nil
+        ENV["AWS_REGION"] = ""
+        SsmScp::Options.default_region.should be_nil
+        ENV.delete("AWS_REGION")
         ENV["AWS_DEFAULT_REGION"] = "ap-south-1"
         SsmScp::Options.default_region.should eq "ap-south-1"
         ENV["AWS_REGION"] = "eu-central-1"
@@ -39,6 +42,11 @@ describe SsmScp::Options do
   end
 
   describe "flags" do
+    it "has no region unless one is given" do
+      parse("a", "b", region: nil).region.should be_nil
+      SsmScp::Options.parse(["a", "b"], nil, nil).region.should be_nil
+    end
+
     it "--region overrides the default" do
       parse("--region", "us-west-2", "a", "b").region.should eq "us-west-2"
     end
@@ -165,9 +173,12 @@ describe SsmScp::Options do
       parse("--region", "--version").region.should eq "--version"
     end
 
-    it "help text mentions every new option" do
+    it "help text mentions every option" do
       text = SsmScp::Options.help_lines.join("\n")
-      {"--sudo", "--chown", "--chmod", "--rsync-arg", "--compress-level"}.each { |flag| text.should contain flag }
+      {"--region", "--profile", "--sudo", "--chown", "--chmod", "--rsync-arg", "--compress-level",
+       "-v, --verbose", "-V, --version", "-h, --help", "AWS_REGION", "AWS_DEFAULT_REGION", "AWS_PROFILE"}.each do |flag|
+        text.should contain flag
+      end
     end
   end
 

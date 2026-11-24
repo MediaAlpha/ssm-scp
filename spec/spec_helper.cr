@@ -13,7 +13,7 @@ def with_tmp_dir(&)
   end
 end
 
-def parse(*args : String, region : String = "us-east-1", profile : String? = nil) : SsmScp::Options
+def parse(*args : String, region : String? = "us-east-1", profile : String? = nil) : SsmScp::Options
   SsmScp::Options.parse(args.to_a, region, profile)
 end
 
@@ -49,4 +49,9 @@ end
 # Writes an executable shell script.
 def write_script(path : Path | String, body : String) : Nil
   File.write(path, "#!/bin/sh\n#{body}\n", perm: 0o755)
+end
+
+# `pending!` when `reason` is set (a skip reason computed at load time).
+def pending_if(reason : String?) : Nil
+  pending!(reason) if reason
 end

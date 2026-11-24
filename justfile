@@ -3,9 +3,9 @@
 default:
     @just --list
 
-# Install dependencies
+# Install dependencies (no network when lib/ already matches shard.lock)
 deps:
-  shards install
+  shards check || shards install
 
 # Build the release binary
 build: deps
@@ -27,16 +27,18 @@ dev: deps
 fmt-check:
   crystal tool format --check ssm-scp.cr src spec
 
-# Build Ameba (pinned in shard.lock) into the gitignored bin/
+# Build Ameba (pinned in shard.lock) into the gitignored bin/, only when it is
+# missing or older than shard.lock
 ameba-build: deps
   mkdir -p bin
-  crystal build lib/ameba/bin/ameba.cr -o bin/ameba
+  [ bin/ameba -nt shard.lock ] || crystal build lib/ameba/bin/ameba.cr -o bin/ameba
 
 # Lint with Ameba
 lint: ameba-build
   bin/ameba ssm-scp.cr src spec
 
-# Offline unit specs (no AWS, network or SSM)
+# Offline specs (no AWS, network or SSM): unit specs plus end-to-end specs of
+# ssm-scp.cr against a fake aws
 spec:
   crystal spec
 
@@ -49,4 +51,4 @@ smoke: dev
 
 # Remove build artefacts
 clean:
-  rm -f ssm-scp
+  rm -f ssm-scp *.dwarf

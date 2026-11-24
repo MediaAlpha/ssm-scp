@@ -7,7 +7,8 @@ module SsmScp
       Help
     end
 
-    property region : String
+    # nil = let the aws CLI choose (AWS_REGION, AWS_DEFAULT_REGION, the profile's config).
+    property region : String?
     property profile : String?
     property? sudo = false
     property compress_level = 6
@@ -21,14 +22,21 @@ module SsmScp
     # Options we do not know (kept, not silently dropped).
     property unknown = [] of String
 
-    def initialize(@region : String, @profile : String? = nil)
+    def initialize(@region : String? = nil, @profile : String? = nil)
     end
 
-    def self.default_region : String
-      ENV["AWS_REGION"]? || ENV["AWS_DEFAULT_REGION"]? || "us-east-1"
+    # From the environment only; nil when unset, so that the aws CLI can fall
+    # back on the region of the selected profile.
+    def self.default_region : String?
+      {"AWS_REGION", "AWS_DEFAULT_REGION"}.each do |name|
+        if (val = ENV[name]?) && !val.empty?
+          return val
+        end
+      end
+      nil
     end
 
-    def self.parse(args : Array(String), region : String = default_region,
+    def self.parse(args : Array(String), region : String? = default_region,
                    profile : String? = ENV["AWS_PROFILE"]?) : Options
       opts = new(region, profile)
       argv = args.dup
@@ -94,13 +102,21 @@ module SsmScp
 
     def self.help_lines : Array(String)
       [
-        "Usage: ssm-scp [--region R] [--profile P] [--sudo] [--compress-level N] [-v] HOST:PATH LOCAL",
-        "       ssm-scp [--region R] [--profile P] [--sudo] [--compress-level N] [-v] LOCAL HOST:PATH",
+        "Usage: ssm-scp [options] HOST:PATH... LOCAL",
+        "       ssm-scp [options] LOCAL... HOST:PATH",
+        "  HOST is an instance id (i-0abc...) or an EC2 Name tag.",
+        "",
+        "Options:",
+        "  --region R          AWS region (default: AWS_REGION, AWS_DEFAULT_REGION, else the profile's region)",
+        "  --profile P         AWS CLI profile (default: AWS_PROFILE)",
         "  --sudo              run remote rsync via sudo (needed for files owned by other users)",
         "  --chown USER:GROUP  set owner/group of transferred files (rsync --chown; needs --sudo)",
         "  --chmod MODE        set mode of transferred files (rsync --chmod, e.g. 0440 or F440)",
         "  --rsync-arg ARG     pass ARG to rsync (repeatable), e.g. --rsync-arg --dry-run",
         "  --compress-level N  zstd/zlib compression level 1–22 (default: 6)",
+        "  -v, --verbose       verbose output",
+        "  -V, --version       print the version and exit",
+        "  -h, --help          print this help and exit",
         "  (--region=R, --profile=P, --chown=X, --chmod=X, --rsync-arg=X, --compress-level=N also work)",
       ]
     end
@@ -110,7 +126,10 @@ module SsmScp
     # doubled quote is a literal one.  A part with whitespace or a quote is
     # therefore single-quoted, with ' written as ''.
     def rsh_command(exe : String) : String
-      parts = [exe, "--region", @region]
+      parts = [exe]
+      if reg = @region
+        parts += ["--region", reg]
+      end
       if prof = @profile
         parts += ["--profile", prof]
       end
@@ -138,9 +157,10 @@ module SsmScp
       flags
     end
 
-    # Full argument list for `rsync` in direct mode.
+    # Full argument list for `rsync` in direct mode.  The positional args come
+    # after `--`, so a file called `-x.txt` is not taken for an option.
     def rsync_argv(exe : String, local_modern : Bool, positional : Array(String)) : Array(String)
-      ["-e", rsh_command(exe)] + rsync_flags(local_modern) + positional
+      ["-e", rsh_command(exe)] + rsync_flags(local_modern) + ["--"] + positional
     end
   end
 end

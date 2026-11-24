@@ -1,0 +1,4 @@
+#!/bin/sh
+# Fake `sudo -n` for the offline specs: runs the command as it is.
+[ "$1" = -n ] && shift
+exec "$@"

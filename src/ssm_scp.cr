@@ -1,6 +1,7 @@
 # Pure, offline-testable pieces of ssm-scp.  ssm-scp.cr requires this file;
 # the specs under spec/ require it too (no AWS, network or SSM involved).
 require "json"
+require "base64"
 require "./ssm_scp/error"
 require "./ssm_scp/constants"
 require "./ssm_scp/text"
@@ -10,3 +11,4 @@ require "./ssm_scp/options"
 require "./ssm_scp/server_args"
 require "./ssm_scp/pty"
 require "./ssm_scp/proctree"
+require "./ssm_scp/proxy"

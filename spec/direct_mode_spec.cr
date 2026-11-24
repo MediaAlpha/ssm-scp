@@ -11,6 +11,11 @@ describe "direct mode: rsync flag assembly" do
     parse("a", "b", region: "r").rsh_command("x").should eq "x --region r --compress-level=6"
   end
 
+  it "omits --region too when no region is set" do
+    parse("a", "b", region: nil).rsh_command("x").should eq "x --compress-level=6"
+    parse("-v", "a", "b", region: nil, profile: "p").rsh_command("x").should eq "x --profile p --compress-level=6 -v"
+  end
+
   describe "rsh command quoting (rsync splits on spaces, honours quotes)" do
     it "single-quotes a part with whitespace" do
       parse("a", "b", region: "r").rsh_command("/Users/me/My Tools/ssm-scp").should eq(
@@ -113,19 +118,26 @@ describe "direct mode: rsync flag assembly" do
     flags.last.should eq "--no-compress"
   end
 
-  it "assembles the full argv: -e, flags, then positional args untouched" do
+  it "assembles the full argv: -e, flags, `--`, then positional args untouched" do
     o = parse("--sudo", "--chmod", "0644", "i-1:/src", "/dst")
     argv = o.rsync_argv("/bin/ssm-scp", false, o.rest)
     argv.should eq [
       "-e", "/bin/ssm-scp --region us-east-1 --sudo --compress-level=6",
       "--progress", "-h", "-z", "--compress-level=6", "--chmod=0644",
-      "i-1:/src", "/dst",
+      "--", "i-1:/src", "/dst",
     ]
+  end
+
+  it "passes several sources and a leading-dash file name after `--`" do
+    o = parse("--", "-x.txt", "b.txt", "i-1:/dst/")
+    argv = o.rsync_argv("x", false, o.rest)
+    argv.last(4).should eq ["--", "-x.txt", "b.txt", "i-1:/dst/"]
+    argv.index!("--").should be > argv.index!("--compress-level=6")
   end
 
   it "does not re-quote positional args that contain spaces or glob characters" do
     o = parse("my host:/a b/*", "/tmp/x y")
-    o.rsync_argv("x", false, o.rest).last(2).should eq ["my host:/a b/*", "/tmp/x y"]
+    o.rsync_argv("x", false, o.rest).last(3).should eq ["--", "my host:/a b/*", "/tmp/x y"]
   end
 end
 

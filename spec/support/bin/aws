@@ -1,0 +1,41 @@
+#!/bin/bash
+# Fake `aws` CLI for the offline end-to-end spec (spec/e2e_spec.cr).  Never
+# contacts AWS.  Needs FAKE_AWS_DIR (log and pid files) in the environment.
+#
+#   aws ec2 describe-instances ...   prints $FAKE_AWS_IDS (default i-0fake)
+#   aws ssm start-session ...        runs a local interactive bash on the PTY
+#                                    as the "remote shell" (starting in
+#                                    $FAKE_CWD, with HOME=$FAKE_HOME)
+#   ... --document-name AWS-StartPortForwardingSession
+#                                    runs fwd.py, a TCP forwarder
+#
+# Like the real thing it keeps a child process (the plugin, here bash or
+# python) that it waits for; every pid it starts is appended to
+# $FAKE_AWS_DIR/pids so the spec can check that nothing is left behind.
+D=${FAKE_AWS_DIR:?FAKE_AWS_DIR is not set}
+echo "aws $$ $*" >> "$D/aws.log"
+echo "$$" >> "$D/pids"
+case "$1 $2" in
+  "ec2 describe-instances") echo "${FAKE_AWS_IDS:-i-0fake}"; exit 0;;
+esac
+doc=""; params=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --document-name) doc=$2; shift;;
+    --parameters) params=$2; shift;;
+  esac
+  shift
+done
+if [ "$doc" = AWS-StartPortForwardingSession ]; then
+  python3 "$(dirname "$0")/../fwd.py" "$params" &
+  echo "$!" >> "$D/pids"
+  wait
+else
+  # A fresh remote tty has echo on until the preflight turns it off.
+  stty echo 2>/dev/null
+  cd "${FAKE_CWD:-/}" || exit 1
+  exec 3<&0
+  env HOME="${FAKE_HOME:-/}" PS1='sh-5.2$ ' TERM=dumb "${FAKE_SHELL:-bash}" --norc --noprofile -i <&3 3<&- &
+  echo "$!" >> "$D/pids"
+  wait
+fi

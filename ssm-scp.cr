@@ -18,15 +18,16 @@
 #
 # Build:  crystal build ssm-scp.cr -o ssm-scp --release
 #
-# Usage (direct):  ssm-scp [opts] HOST:PATH LOCAL
-#                  ssm-scp [opts] LOCAL HOST:PATH
+# Usage (direct):  ssm-scp [opts] HOST:PATH... LOCAL
+#                  ssm-scp [opts] LOCAL... HOST:PATH
 # Usage (via rsync --rsh):
 #   rsync -e "ssm-scp [--region R] [--profile P] [-v]" \
 #         i-0abc1234:/remote/path /local/dst
 #
 # Architecture — three phases:
 #   1. PTY session  : shell setup + starts a Python one-shot TCP listener that
-#                     will exec rsync --server once a connection arrives.
+#                     will run rsync --server once a client has sent the
+#                     per-run auth token over the connection.
 #   2. Port forward : second SSM session (AWS-StartPortForwardingSession) builds
 #                     a clean TCP tunnel from a local port to the remote listener.
 #   3. TCP proxy    : stdin/stdout ↔ TCPSocket — binary-clean by design,
@@ -54,25 +55,96 @@ end
 
 # Child processes to stop when we leave, however we leave.  Each `aws`
 # process runs `session-manager-plugin` as its own child, so the whole tree
-# is stopped (SIGTERM, then SIGKILL for what ignores it).  Idempotent.
+# is stopped (SIGTERM, then SIGKILL for what ignores it).  Idempotent, and
+# safe against a second caller (a signal handler, `die`, at_exit) arriving
+# while a cleanup is under way: it waits for that one, and a process is only
+# taken off the list once it has been through the full TERM + KILL pass.
+#
+# Killing the plugin does not close the tunnel on the instance (the SSM agent
+# keeps the connection to the remote listener open, so rsync there would wait
+# forever and leave its temporary file), and it does not end the shell
+# session either.  So, in this order:
+#   1. close our end of the tunnel socket (the plugin passes the close on);
+#      after a signal, wait until the remote listener reports that rsync has
+#      ended (it has then removed its temporary file);
+#   2. stop the port-forward, newest process first;
+#   3. say `exit` to the remote shell and give its session time to end;
+#   4. TERM/KILL whatever is left.
 module Cleanup
-  @@procs = [] of Process
+  @@procs = [] of {Process, IO?}
+  @@sock : TCPSocket?
+  @@pty : IO::FileDescriptor?
+  @@token : String?
+  @@running = false
   class_property? stopping = false
 
-  def self.register(proc : Process) : Process
-    @@procs << proc
+  EXIT_GRACE = 2.seconds
+
+  # How long, after a signal, to wait for the remote rsync to end once the
+  # tunnel is closed.
+  def self.remote_wait : Float64
+    ENV["SSM_SCP_REMOTE_WAIT"]?.try(&.to_f?) || 8.0 # hidden knob for the specs
+  end
+
+  # `farewell`: the PTY master of a shell session; `exit` is typed into it
+  # before the process is killed.
+  def self.register(proc : Process, farewell : IO? = nil) : Process
+    @@procs << {proc, farewell}
     proc
   end
 
+  # The tunnel socket, and where the remote listener's result frame (marked
+  # with `token`) will show up.
+  def self.tunnel(sock : TCPSocket, pty : IO::FileDescriptor, token : String) : Nil
+    @@sock = sock
+    @@pty = pty
+    @@token = token
+  end
+
   def self.run : Nil
-    procs = @@procs.dup
-    @@procs.clear
-    procs.each do |proc|
-      next unless proc.exists?
-      SsmScp::ProcTree.kill_tree(proc.pid) { |pid| pid == proc.pid ? proc.exists? : Process.exists?(pid) }
-    rescue
-      nil
+    if @@running
+      while @@running
+        sleep 0.05.seconds
+      end
+      return
     end
+    @@running = true
+    begin
+      close_tunnel
+      @@procs.dup.reverse_each do |(proc, farewell)|
+        stop(proc, farewell)
+        @@procs.delete({proc, farewell})
+      end
+    ensure
+      @@running = false
+    end
+  end
+
+  private def self.close_tunnel : Nil
+    sock = @@sock
+    @@sock = nil
+    return if sock.nil? || sock.closed?
+    sock.close rescue nil
+    # Only when interrupted mid-transfer: nobody else is reading the PTY then.
+    if stopping? && (pty = @@pty) && (token = @@token)
+      read_remote_result(pty, token, remote_wait) rescue nil
+    end
+  end
+
+  private def self.stop(proc : Process, farewell : IO?) : Nil
+    return unless proc.exists?
+    if io = farewell
+      io.print("exit\n") rescue nil
+      deadline = Time.instant + EXIT_GRACE
+      while proc.exists? && Time.instant < deadline
+        sleep 0.05.seconds
+      end
+    end
+    if proc.exists?
+      SsmScp::ProcTree.kill_tree(proc.pid) { |pid| pid == proc.pid ? proc.exists? : Process.exists?(pid) }
+    end
+  rescue
+    nil
   end
 end
 
@@ -86,15 +158,37 @@ STDOUT.exit_on_broken_pipe = false
 STDERR.exit_on_broken_pipe = false
 
 # Stop our child processes and exit with the conventional 128+signal code.
-{% for sig in [:INT, :TERM, :HUP] %}
+# USR1 matters most: rsync sends SIGUSR1 to its rsh child on Ctrl-C or on an
+# error.  A signal that arrives while the first one is being handled is
+# ignored; the first handler finishes the cleanup and exits.
+{% for sig in [:INT, :TERM, :HUP, :USR1, :USR2, :QUIT] %}
   Signal::{{ sig.id }}.trap do
+    next if Cleanup.stopping?
     Cleanup.stopping = true
     Cleanup.run
     exit 128 + Signal::{{ sig.id }}.value
   end
 {% end %}
 
+# A progress line ("... ") that is still open when an error is printed gets
+# finished first, so the error starts on a line of its own.
+module Progress
+  class_property? open = false
+
+  def self.start(text : String) : Nil
+    STDERR.print text
+    self.open = true
+  end
+
+  def self.finish(text : String) : Nil
+    STDERR.puts text
+    self.open = false
+  end
+end
+
 def die(msg : String) : NoReturn
+  STDERR.puts if Progress.open?
+  Progress.open = false
   STDERR.puts "ssm-scp: #{msg}"
   Cleanup.run
   exit 1
@@ -111,34 +205,48 @@ def vputs(msg : String)
   STDERR.puts msg if Cfg.verbose?
 end
 
+# A hidden knob for the specs: seconds, overrides the default.
+def env_seconds(name : String, default : Float64) : Time::Span
+  (ENV[name]?.try(&.to_f?) || default).seconds
+end
+
+def require_aws : Nil
+  return if Process.find_executable("aws")
+  die "aws CLI not found — install it (brew install awscli) and session-manager-plugin"
+end
+
 # ── Resolution cache (shared with scp-ssm) ───────────────────────────────────
 
 RESOLVE_CACHE = SsmScp::ResolveCache.new
 
 # Returns {instance id, true if it came from the cache}.
-def resolve_target(name : String, region : String, profile : String?) : {String, Bool}
+def resolve_target(name : String, region : String?, profile : String?) : {String, Bool}
   return {name, false} if SsmScp::Resolve.instance_id?(name)
+  guarded { SsmScp::Resolve.check_name!(name) }
   if cached = RESOLVE_CACHE.lookup(name, region, profile)
     vputs "ssm-scp: '#{name}' resolved from cache -> #{cached}"
     return {cached, true}
   end
-  STDERR.print "ssm-scp: resolving '#{name}' via EC2 Name tag ..."
+  Progress.start "ssm-scp: resolving '#{name}' via EC2 Name tag ..."
   args = SsmScp::Resolve.ec2_lookup_args(name, region, profile)
   stdout = IO::Memory.new
   stderr_io = IO::Memory.new
   status = Process.run("aws", args: args, output: stdout, error: stderr_io)
   die "EC2 lookup failed: #{stderr_io.to_s.strip}" unless status.success?
   ids = SsmScp::Resolve.parse_ids(stdout.to_s)
-  STDERR.puts " #{ids.first? || "not found"}"
-  resolved = case ids.size
-             when 0 then die "No running instance with Name='#{name}' in #{region}"
-             when 1 then ids.first
-             else
-               STDERR.puts "ssm-scp: warning: #{ids.size} instances match, using #{ids.first}"
-               ids.first
-             end
-  RESOLVE_CACHE.store(name, region, resolved, profile)
-  {resolved, false}
+  Progress.finish " #{ids.first? || "not found"}"
+  case ids.size
+  when 0
+    die "No running instance with Name='#{name}'#{region ? " in #{region}" : ""}"
+  when 1
+    RESOLVE_CACHE.store(name, region, ids.first, profile)
+    {ids.first, false}
+  else
+    # Which one is meant is a guess, so do not make it stick.
+    STDERR.puts "ssm-scp: warning: #{ids.size} instances match '#{name}' (#{ids.join(", ")}), " \
+                "using #{ids.first}; not cached, use an instance id to be sure"
+    {ids.first, false}
+  end
 end
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
@@ -161,9 +269,10 @@ compress_level = opts.compress_level
 Cfg.verbose = opts.verbose?
 argv = opts.rest
 
-# Direct invocation: ssm-scp HOST:PATH LOCAL (or LOCAL HOST:PATH)
+# Direct invocation: ssm-scp HOST:PATH... LOCAL (or LOCAL... HOST:PATH)
 if SsmScp::Resolve.direct_mode?(argv)
   die "unknown option: #{opts.unknown.join(", ")}" unless opts.unknown.empty?
+  require_aws
   unless Process.find_executable("rsync")
     die "rsync not found locally — install rsync first (brew install rsync)"
   end
@@ -188,28 +297,27 @@ server_args = SsmScp::ServerArgs.new(argv)
 # Already escaped by rsync for a remote shell; see SsmScp::ServerArgs.
 rsync_args_escaped = server_args.escaped
 
+require_aws
+
 # ── Phase 1: PTY session — shell setup + Python listener ─────────────────────
 
 target, from_cache = resolve_target(instance_id, region, profile)
-aws_args = ["ssm", "start-session", "--target", target, "--region", region]
-if profile
-  aws_args += ["--profile", profile]
-end
+aws_args = SsmScp::Resolve.session_args(target, region, profile)
 
 master, slave_io = guarded { SsmScp.open_pty }
 
 Cleanup.register(Process.new("aws", args: aws_args,
-  input: slave_io, output: slave_io, error: slave_io))
+  input: slave_io, output: slave_io, error: slave_io), master)
 slave_io.close
 
-STDERR.print "ssm-scp: connecting to #{target} ..."
+Progress.start "ssm-scp: connecting to #{target} ..."
 ok, pty_out = begin
   wait_for_prompt(master, CONNECT_TIMEOUT)
 rescue ex : SsmScp::Error
   {false, ex.message.to_s}
 end
 unless ok
-  STDERR.puts " failed"
+  Progress.finish " failed"
   STDERR.puts pty_out unless pty_out.empty?
   if from_cache
     RESOLVE_CACHE.evict(instance_id, region, profile)
@@ -218,15 +326,18 @@ unless ok
   Cleanup.run
   exit 1
 end
-STDERR.puts " connected"
+Progress.finish " connected"
 
 tok = new_token
-STDERR.print "ssm-scp: checking remote shell, rsync and python3 ..."
+Progress.start "ssm-scp: checking remote shell, rsync, python3 and base64 ..."
+# Plain text: a fixed ASCII line that has to work before we know that base64
+# exists.  Everything after it is sent through SsmScp::Remote.wrap.
 master.print(SsmScp::Remote.preflight_command(tok))
 case rc = guarded { read_until_sentinel(master, tok, SETUP_TIMEOUT) }
-when  0 then STDERR.puts " done"
+when  0 then Progress.finish " done"
 when  1 then die "rsync not found on remote — install it first (sudo dnf install -y rsync)"
 when  2 then die "python3 not found on remote — install it first (sudo dnf install -y python3)"
+when  3 then die "base64 not found on remote — install it first (sudo dnf install -y coreutils)"
 when -1 then die "timed out waiting for the remote shell setup (no answer within #{SETUP_TIMEOUT.to_i}s)"
 else         die "remote shell setup failed (rc=#{rc})"
 end
@@ -244,21 +355,26 @@ src_paths = server_args.src_paths
 unless src_paths.empty?
   paths_escaped = src_paths.join(" ") # already escaped by rsync, see above
   tok_chk = new_token
-  master.print(SsmScp::Remote.check_command(paths_escaped, use_sudo, tok_chk))
-  rc_chk = guarded { read_until_sentinel(master, tok_chk, SETUP_TIMEOUT) }
+  SsmScp::Remote.send(master, SsmScp::Remote.wrap(SsmScp::Remote.check_command(paths_escaped, use_sudo, tok_chk)))
+  rc_chk, failures = guarded { read_check_result(master, tok_chk, SETUP_TIMEOUT) }
   unless rc_chk == 0
-    die SsmScp::Remote.check_failure(rc_chk, src_paths)
+    failed = failures.select { |(code, _)| code == rc_chk }.map { |(_, path)| path }
+    die SsmScp::Remote.check_failure(rc_chk, src_paths, use_sudo, failed)
   end
 end
 
 # Start the Python listener in background.  It prints PORT=XXXX then blocks on
 # accept(); we read the port back through the PTY using read_remote_port.
-# SIGHUP is set to SIG_IGN before execvp so rsync survives the PTY closing.
-STDERR.print "ssm-scp: starting remote listener#{use_sudo ? " (sudo)" : ""} ..."
+# `auth` is a second secret, separate from the frame token `run_tok`: the
+# frame token is in the listener's argv (visible in `ps` to other users of the
+# instance), the auth token is passed in its environment and must be the
+# first bytes sent over the tunnel, or rsync is not started.
+Progress.start "ssm-scp: starting remote listener#{use_sudo ? " (sudo)" : ""} ..."
 run_tok = new_token
-master.print(SsmScp::Remote.listener_command(use_sudo, rsync_args_escaped, run_tok))
+auth = Random::Secure.hex(16)
+SsmScp::Remote.send(master, SsmScp::Remote.wrap(SsmScp::Remote.listener_command(use_sudo, rsync_args_escaped, run_tok, auth)))
 remote_port = guarded { read_remote_port(master, PORT_TIMEOUT) } || die "timed out waiting for remote rsync port"
-STDERR.puts " port #{remote_port}"
+Progress.finish " port #{remote_port}"
 
 # ── Phase 2: SSM port-forwarding session ─────────────────────────────────────
 
@@ -269,15 +385,8 @@ local_port = begin
   p
 end
 
-STDERR.print "ssm-scp: port-forwarding #{local_port} → #{remote_port} ..."
-params = "{\"portNumber\":[\"#{remote_port}\"],\"localPortNumber\":[\"#{local_port}\"]}"
-fwd_args = ["ssm", "start-session",
-            "--target", target, "--region", region,
-            "--document-name", "AWS-StartPortForwardingSession",
-            "--parameters", params]
-if profile
-  fwd_args += ["--profile", profile]
-end
+Progress.start "ssm-scp: port-forwarding #{local_port} → #{remote_port} ..."
+fwd_args = SsmScp::Resolve.forward_args(target, local_port, remote_port, region, profile)
 
 null_r = File.open(File::NULL, "r")
 null_w = File.open(File::NULL, "w")
@@ -319,7 +428,7 @@ sock : TCPSocket? = nil
   sleep 0.5.seconds
 end
 die "port-forward tunnel did not establish within #{FWD_TIMEOUT.to_i}s#{fwd_stderr(fwd_err)}" unless sock
-STDERR.puts " ready"
+Progress.finish " ready"
 
 # The PTY session stays open: the listener reports rsync's stderr and exit
 # code through it once the transfer is over.
@@ -328,6 +437,14 @@ STDERR.puts " ready"
 
 tcp = sock
 tcp.sync = true
+Cleanup.tunnel(tcp, master, run_tok)
+
+# The listener wants the auth token before it starts rsync.
+begin
+  tcp.write(auth.to_slice)
+rescue ex
+  die "could not send the auth token to the remote listener: #{ex.message}"
+end
 
 # Crystal initialises STDIN/STDOUT as blocking=true; set non-blocking so both
 # proxy fibers use the event loop instead of stalling the OS thread.
@@ -335,7 +452,12 @@ IO::FileDescriptor.set_blocking(STDIN.fd, false)
 IO::FileDescriptor.set_blocking(STDOUT.fd, false)
 STDOUT.sync = true
 
+# While the transfer runs the PTY session is otherwise idle; a no-op line now
+# and then keeps SSM's idle timeout from ending it (and with it the result).
+keepalive = SsmScp::Keepalive.start(master, env_seconds("SSM_SCP_KEEPALIVE", KEEPALIVE_INTERVAL))
+
 done = Channel(Nil).new(2)
+remote_closed = Channel(Nil).new
 
 spawn do
   buf = Bytes.new(65536)
@@ -343,10 +465,10 @@ spawn do
     n = tcp.read(buf)
     break if n <= 0
     STDOUT.write(buf[0, n])
-    STDOUT.flush
   end
 rescue
 ensure
+  remote_closed.close
   STDOUT.close rescue nil # EOF to local rsync's stdin → rsync exits
   STDIN.close rescue nil  # unblocks Fiber 2 if it is stuck on STDIN.read
   done.send(nil)
@@ -361,8 +483,10 @@ spawn do
       tcp.write(buf[0, n])
     end
     # Local EOF: half-close so remote -> local data keeps flowing; Fiber 1
-    # ends on the remote's EOF.
+    # ends on the remote's EOF.  If the remote does not close within a while,
+    # close the socket fully rather than hang forever.
     tcp.close_write rescue nil
+    SsmScp.close_if_remote_stays_open(tcp, remote_closed, env_seconds("SSM_SCP_HALF_CLOSE_TIMEOUT", HALF_CLOSE_TIMEOUT))
   rescue
     # e.g. a failed write: close fully so Fiber 1's tcp.read is unblocked.
     tcp.close rescue nil
@@ -371,6 +495,7 @@ spawn do
 end
 
 2.times { done.receive }
+keepalive.stop
 tcp.close rescue nil
 
 # A signal handler is shutting us down (it exits with 128+signal): leave the
@@ -391,6 +516,6 @@ if result
 else
   STDERR.puts "ssm-scp: warning: no exit status from the remote rsync (assuming success)"
 end
-master.close rescue nil
 Cleanup.run
+master.close rescue nil
 exit remote_rc

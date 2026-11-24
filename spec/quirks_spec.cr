@@ -7,6 +7,7 @@ describe "known quirks" do
     o.region.should eq "us-east-1"
     o.unknown.should eq ["--regoin"]
     o.rest.should eq ["us-west-2", "a:b", "c"]
-    SsmScp::Resolve.direct_mode?(o.rest).should be_false
+    # Three positionals with a remote one: direct mode, rsync then rejects it.
+    SsmScp::Resolve.direct_mode?(o.rest).should be_true
   end
 end

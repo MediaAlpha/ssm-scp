@@ -66,8 +66,10 @@ describe "strip_ansi" do
     cleaned.should start_with "a"
   end
 
-  it "only strips CSI sequences" do
-    strip_ansi("\e]0;title\a$ ").should contain "$ "
+  it "strips OSC sequences ended by BEL or ESC backslash" do
+    strip_ansi("\e]0;title\a$ ").should eq "$ "
+    strip_ansi("\e]2;ec2-user@host: ~\e\\[ec2-user@host ~]$ ").should eq "[ec2-user@host ~]$ "
+    strip_ansi("\e]0;a\ab\e]7;file:///x\a").should eq "b"
   end
 end
 
@@ -199,6 +201,13 @@ describe SsmScp::Resolve do
       args.should_not contain "--profile"
     end
 
+    it "passes no --region when none is set" do
+      args = SsmScp::Resolve.ec2_lookup_args("web", nil, nil)
+      args.should_not contain "--region"
+      args.last(2).should eq ["--output", "text"]
+      SsmScp::Resolve.ec2_lookup_args("web", nil, "prod").last(2).should eq ["--profile", "prod"]
+    end
+
     it "appends --profile when set" do
       SsmScp::Resolve.ec2_lookup_args("web", "r", "prod").last(2).should eq ["--profile", "prod"]
     end
@@ -212,19 +221,59 @@ describe SsmScp::Resolve do
     end
   end
 
+  describe ".check_name!" do
+    it "accepts ordinary Name tags" do
+      {"web-1", "my server", "a.b_c:d"}.each { |name| SsmScp::Resolve.check_name!(name) }
+    end
+
+    it "rejects the EC2 filter's list separator and wildcards" do
+      {"a,b", "web-*", "web-?", "*"}.each do |name|
+        expect_raises(SsmScp::Error, /use the instance id/) { SsmScp::Resolve.check_name!(name) }
+      end
+    end
+  end
+
+  describe "aws arguments" do
+    it "adds --region and --profile only when set" do
+      SsmScp::Resolve.aws_common_args(nil, nil).should be_empty
+      SsmScp::Resolve.aws_common_args("r", nil).should eq ["--region", "r"]
+      SsmScp::Resolve.aws_common_args(nil, "p").should eq ["--profile", "p"]
+      SsmScp::Resolve.aws_common_args("r", "p").should eq ["--region", "r", "--profile", "p"]
+    end
+
+    it "builds the shell session and port-forward calls" do
+      SsmScp::Resolve.session_args("i-1", nil, nil).should eq ["ssm", "start-session", "--target", "i-1"]
+      SsmScp::Resolve.session_args("i-1", "us-west-2", "p").should eq(
+        ["ssm", "start-session", "--target", "i-1", "--region", "us-west-2", "--profile", "p"])
+      fwd = SsmScp::Resolve.forward_args("i-1", 5000, 6000, nil, nil)
+      fwd.should_not contain "--region"
+      fwd.should contain "AWS-StartPortForwardingSession"
+      JSON.parse(fwd[fwd.index!("--parameters") + 1]).should eq(
+        JSON.parse(%({"portNumber":["6000"],"localPortNumber":["5000"]})))
+      SsmScp::Resolve.forward_args("i-1", 1, 2, "r", nil).last(2).should eq ["--region", "r"]
+    end
+  end
+
   describe ".direct_mode?" do
-    it "needs exactly two positional args with a remote one" do
+    it "needs two or more positional args, at least one remote" do
       SsmScp::Resolve.direct_mode?(["f", "i-1:/x"]).should be_true
       SsmScp::Resolve.direct_mode?(["i-1:/x", "."]).should be_true
       SsmScp::Resolve.direct_mode?(["a:/x", "b:/y"]).should be_true
+      SsmScp::Resolve.direct_mode?(["f", "g", "i-1:/x"]).should be_true
+      SsmScp::Resolve.direct_mode?(["i-1:/x", "i-1:/y", "dst"]).should be_true
     end
 
-    it "is false for local copies, wrong counts and rsh mode" do
+    it "is false for local copies, a single arg and rsh mode" do
       SsmScp::Resolve.direct_mode?(["a", "b"]).should be_false
+      SsmScp::Resolve.direct_mode?(["a", "b", "c"]).should be_false
       SsmScp::Resolve.direct_mode?(["i-1:/x"]).should be_false
       SsmScp::Resolve.direct_mode?([] of String).should be_false
-      SsmScp::Resolve.direct_mode?(["f", "g", "i-1:/x"]).should be_false
       SsmScp::Resolve.direct_mode?(["i-1", "rsync", "--server", "."]).should be_false
+    end
+
+    it "treats --server anywhere as rsh mode, even next to something colon-ish" do
+      SsmScp::Resolve.direct_mode?(["i-1", "rsync", "--server", "--sender", ".", "/a:b"]).should be_false
+      SsmScp::Resolve.direct_mode?(["i-1", "sudo", "rsync", "--server", "."]).should be_false
     end
   end
 end

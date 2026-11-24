@@ -1,4 +1,4 @@
-ssm-scp
+/ssm-scp
 *.dwarf
-lib/
-bin/
+/lib/
+/bin/

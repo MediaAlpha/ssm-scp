@@ -81,6 +81,50 @@ describe SsmScp::Sentinel do
     end
   end
 
+  describe ".check" do
+    it "returns the rc and the failing {code, path} lines before it" do
+      raw = "echo\r\nTOKF2 /a b\r\nTOKF1 /c\r\nTOK1\r\n"
+      SsmScp::Sentinel.check(raw, "TOK").should eq({1, [{2, "/a b"}, {1, "/c"}]})
+    end
+
+    it "returns an empty list for rc 0 and nil until the rc line is in" do
+      SsmScp::Sentinel.check("TOK0\n", "TOK").should eq({0, [] of {Int32, String}})
+      SsmScp::Sentinel.check("TOKF2 /a\n", "TOK").should be_nil
+      SsmScp::Sentinel.check("TOKF2 /a\nTOK2", "TOK").should be_nil
+    end
+
+    it "ignores failure lines of another token" do
+      SsmScp::Sentinel.check("OTHERF2 /x\nTOK2\n", "TOK").should eq({2, [] of {Int32, String}})
+    end
+  end
+
+  describe ".line_end?" do
+    it "needs token, digits and a newline in the scanned window" do
+      SsmScp::Sentinel.line_end?("junk TOK12\r\n".to_slice, "TOK").should be_true
+      SsmScp::Sentinel.line_end?("TOKB\nTOK12".to_slice, "TOK").should be_false
+      SsmScp::Sentinel.line_end?("TOK1\n".to_slice, "TOK", 3).should be_false
+    end
+  end
+
+  describe ".prompt?" do
+    it "accepts $, #, % and > prompts, with ANSI and OSC noise" do
+      {"user@h:~$ ", "root# ", "host% ", "ps> ", "\e]0;user@h: ~\a[user@h ~]$ ", "\e]2;t\e\\\e[?2004h$ "}.each do |text|
+        SsmScp::Sentinel.prompt?(text.to_slice).should be_true
+      end
+    end
+
+    it "is false when the output does not end in a prompt" do
+      SsmScp::Sentinel.prompt?("Starting session\r\n".to_slice).should be_false
+      SsmScp::Sentinel.prompt?("cost: $5 and more\n$ more".to_slice).should be_false
+      SsmScp::Sentinel.prompt?(Bytes.empty).should be_false
+    end
+
+    it "only looks at the tail (a prompt far back does not count)" do
+      SsmScp::Sentinel.prompt?(("$ " + ("x" * 5000)).to_slice).should be_false
+      SsmScp::Sentinel.prompt?((("x" * 5000) + "$ ").to_slice).should be_true
+    end
+  end
+
   describe ".port" do
     it "parses PORT=n followed by a newline" do
       SsmScp::Sentinel.port("PORT=41234\r\n").should eq 41234
@@ -142,6 +186,35 @@ describe "PTY read helpers" do
         r.close
         w.close
       end
+    end
+
+    it "accepts % and > prompts too, and ignores an OSC title in front" do
+      {"user@h % ", "C:\\> ", "\e]0;title\a$ "}.each do |prompt|
+        r, w = IO.pipe
+        w << "banner\r\n" << prompt
+        w.flush
+        wait_for_prompt(r, 1.0)[0].should be_true
+        r.close
+        w.close
+      end
+    end
+
+    it "stays fast with a lot of output before the prompt (no rescan of everything)" do
+      r, w = IO.pipe
+      spawn do
+        400.times do
+          w << ("banner line\r\n" * 300)
+          w.flush
+        end
+        w << "$ "
+        w.flush
+      end
+      started = Time.instant
+      ok, _ = wait_for_prompt(r, 20.0)
+      ok.should be_true
+      (Time.instant - started).should be < 10.seconds
+      r.close
+      w.close
     end
 
     it "times out and returns what it saw" do
@@ -285,6 +358,28 @@ describe "PTY read helpers" do
       w << "TOKB\r\npartial"
       w.flush
       read_remote_result(r, "TOK", 0.3).should be_nil
+      r.close
+      w.close
+    end
+
+    it "stays correct with a large stderr text and a frame split over many reads" do
+      r, w = IO.pipe
+      body = ("e" * 200 + "\r\n") * 2000
+      spawn do
+        w << "TOKB\r\n"
+        body.each_char.each_slice(1500) do |chunk|
+          w << chunk.join
+          w.flush
+        end
+        w << "\r\nTO"
+        w.flush
+        sleep 0.2.seconds
+        w << "K9\r\n"
+        w.flush
+      end
+      text, rc = read_remote_result(r, "TOK", 10.0) || raise "no frame"
+      rc.should eq 9
+      text.size.should eq(body.gsub("\r\n", "\n").rstrip.size)
       r.close
       w.close
     end

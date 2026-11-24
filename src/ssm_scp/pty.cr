@@ -32,7 +32,13 @@ module SsmScp
 
     master = IO::FileDescriptor.new(master_raw)
     master.sync = true
-    {master, IO::FileDescriptor.new(slave_raw)}
+    slave = IO::FileDescriptor.new(slave_raw)
+    # Neither end may leak into other children we start (e.g. the port-forward
+    # `aws`, which would then hold the PTY open).  Process.new dup2s the slave
+    # onto the child's stdio, which clears the flag on those copies only.
+    master.close_on_exec = true
+    slave.close_on_exec = true
+    {master, slave}
   end
 
   module Sentinel
@@ -61,6 +67,33 @@ module SsmScp
       return unless m
       rc = m[2].to_i? || return
       {m[1].rstrip, rc}
+    end
+
+    # Is there a complete `<token><digits>` line in buf[from..]?  Used to
+    # decide cheaply (on the new bytes only) when to parse a frame.
+    def self.line_end?(buf : Bytes, token : String, from : Int32 = 0) : Bool
+      start = from.clamp(0, buf.size)
+      /#{Regex.escape(token)}\d+\n/.matches?(strip_ansi(String.new(buf[start..])))
+    end
+
+    # The answer to Remote.check_command: {overall rc, [{code, path}]} once
+    # `<token><rc>` has arrived, else nil.  Input is raw PTY text.
+    def self.check(raw : String, token : String) : {Int32, Array({Int32, String})}?
+      text = strip_ansi(raw)
+      tok = Regex.escape(token)
+      m = /#{tok}(\d+)\n/.match(text) || return
+      failures = [] of {Int32, String}
+      text[0, m.begin].scan(/(?m)^#{tok}F(\d) ([^\n]*)$/) do |found|
+        failures << {found[1].to_i, found[2]}
+      end
+      {m[1].to_i, failures}
+    end
+
+    # Does the tail of the output (the last `window` bytes) end in a shell
+    # prompt?  Only the tail is looked at, so the work does not grow with the
+    # amount of output.
+    def self.prompt?(buf : Bytes, window : Int32 = 1024) : Bool
+      PROMPT_RE.matches?(strip_ansi(String.new(buf[{buf.size - window, 0}.max..])))
     end
 
     # `PORT=<digits>` followed by a newline (so a split read cannot yield a
@@ -100,15 +133,17 @@ def wait_for_prompt(master : IO::FileDescriptor, timeout : Float64) : {Bool, Str
       raise ex if acc.empty?
       return {false, strip_ansi(acc.to_s).strip}
     end
-    acc.write(chunk) unless chunk.empty?
-    return {true, ""} if PROMPT_RE.match(strip_ansi(acc.to_s))
+    next if chunk.empty?
+    acc.write(chunk)
+    return {true, ""} if SsmScp::Sentinel.prompt?(acc.to_slice)
   end
   {false, strip_ansi(acc.to_s).strip}
 end
 
-# Returns the digits after the sentinel, or -1 on timeout.  Each read only
-# rescans the new bytes (plus a small overlap), so the work stays linear.
-def read_until_sentinel(master : IO::FileDescriptor, sentinel : String, timeout : Float64) : Int32
+# Reads until `<sentinel><digits>` shows up.  Returns {rc, everything read},
+# or {-1, ...} on timeout.  Each read only rescans the new bytes (plus a small
+# overlap), so the work stays linear.
+def read_sentinel_buffer(master : IO::FileDescriptor, sentinel : String, timeout : Float64) : {Int32, IO::Memory}
   full = IO::Memory.new
   scanned = 0
   deadline = Time.instant + timeout.seconds
@@ -119,20 +154,37 @@ def read_until_sentinel(master : IO::FileDescriptor, sentinel : String, timeout 
     from = SsmScp::Sentinel.resume_from(scanned, sentinel)
     scanned = full.bytesize.to_i32
     if rc = SsmScp::Sentinel.scan(full.to_slice, sentinel, from)
-      return rc
+      return {rc, full}
     end
   end
-  -1
+  {-1, full}
 end
 
-# Reads PTY output until PORT=\d+ appears, returns the port number.
+# Returns the digits after the sentinel, or -1 on timeout.
+def read_until_sentinel(master : IO::FileDescriptor, sentinel : String, timeout : Float64) : Int32
+  read_sentinel_buffer(master, sentinel, timeout)[0]
+end
+
+# The answer to Remote.check_command: {rc, [{code, path}]}; rc -1 on timeout.
+def read_check_result(master : IO::FileDescriptor, token : String, timeout : Float64) : {Int32, Array({Int32, String})}
+  rc, full = read_sentinel_buffer(master, token, timeout)
+  return {-1, [] of {Int32, String}} if rc < 0
+  SsmScp::Sentinel.check(full.to_s, token) || {rc, [] of {Int32, String}}
+end
+
+# Reads PTY output until PORT=\d+ appears, returns the port number.  Only
+# the new bytes (plus an overlap) are searched on each read.
 def read_remote_port(master : IO::FileDescriptor, timeout : Float64) : Int32?
   acc = IO::Memory.new
+  scanned = 0
   deadline = Time.instant + timeout.seconds
   while Time.instant < deadline
     chunk = pty_read_chunk(master, 0.2)
-    acc.write(chunk) unless chunk.empty?
-    if port = SsmScp::Sentinel.port(acc.to_s)
+    next if chunk.empty?
+    acc.write(chunk)
+    from = SsmScp::Sentinel.resume_from(scanned, "PORT=")
+    scanned = acc.bytesize.to_i32
+    if port = SsmScp::Sentinel.port(String.new(acc.to_slice[from..]))
       return port
     end
   end
@@ -141,9 +193,11 @@ end
 
 # Reads the PTY until the listener's result frame for `token` arrives.
 # Returns {rsync's stderr text, rc}, or nil on timeout or if the session
-# closed first.
+# closed first.  The frame is only parsed once its closing line is in; that is
+# looked for in the new bytes alone.
 def read_remote_result(master : IO::FileDescriptor, token : String, timeout : Float64) : {String, Int32}?
   acc = IO::Memory.new
+  scanned = 0
   deadline = Time.instant + timeout.seconds
   while Time.instant < deadline
     chunk = begin
@@ -151,7 +205,11 @@ def read_remote_result(master : IO::FileDescriptor, token : String, timeout : Fl
     rescue SsmScp::Error
       return SsmScp::Sentinel.result(acc.to_s, token)
     end
-    acc.write(chunk) unless chunk.empty?
+    next if chunk.empty?
+    acc.write(chunk)
+    from = SsmScp::Sentinel.resume_from(scanned, token)
+    scanned = acc.bytesize.to_i32
+    next unless SsmScp::Sentinel.line_end?(acc.to_slice, token, from)
     if res = SsmScp::Sentinel.result(acc.to_s, token)
       return res
     end

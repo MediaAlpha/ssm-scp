@@ -2,3 +2,4 @@
 *.dwarf
 /lib/
 /bin/
+/ssm-scp-linux-arm64

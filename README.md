@@ -10,14 +10,14 @@ Three phases per transfer:
 2. **Port forward** — opens a second SSM session (`AWS-StartPortForwardingSession`) to create a clean TCP tunnel from a local port to the remote listener.
 3. **TCP proxy** — bridges `stdin`/`stdout` through the tunnel so the local `rsync` process sees a standard binary stream.
 
-Compression negotiates automatically: zstd if both sides have rsync ≥ 3.2, zlib otherwise.
+Compression is negotiated by rsync itself (zstd if both sides have rsync ≥ 3.2, zlib otherwise); ssm-scp does not probe for it and only passes `--compress-level`.
 
 ## Requirements
 
 | Where  | What |
 |--------|------|
 | Local  | `aws` CLI + `session-manager-plugin`, `rsync` |
-| Remote | SSM agent, IAM instance profile with SSM permissions, `python3`, `rsync` |
+| Remote | SSM agent, IAM instance profile with SSM permissions, `python3`, `rsync`; passwordless `sudo` when `--sudo` is used (`sudo -n`, so a password prompt fails fast) |
 
 ## Local dependencies
 
@@ -74,15 +74,36 @@ rsync -e "ssm-scp --region us-west-2" i-0abc1234:/remote/path ./local/
 | `-v`, `--verbose` | off | Verbose output |
 | `-V`, `--version` | | Print version and exit |
 
+Valued options also accept the `--opt=value` form: `--region=R`, `--profile=P`,
+`--chown=X`, `--chmod=X`, `--rsync-arg=X`, `--compress-level=N`.
+
+`--sudo` runs the remote side as `sudo -n`: the remote user needs passwordless
+sudo, otherwise the transfer fails at once instead of waiting for a password.
+
+Unknown options are not dropped silently. In direct mode they are an error
+(`unknown option: X`); in `--rsh` mode, where rsync may add its own flags, they are
+ignored with a warning on stderr (`ssm-scp: warning: ignoring unknown option(s): ...`).
+
 ## Development
 
 ```sh
 just          # list available recipes
 just dev      # fast debug build
-just test     # smoke test (--help)
+just test     # format check + Ameba lint + offline specs (crystal spec)
+just spec     # only the specs
+just lint     # only Ameba (built into bin/ from the pinned shard)
+just smoke    # build and run ./ssm-scp --help
 just build    # optimised release binary
 just clean    # remove build artefacts
 ```
+
+The specs under `spec/` are offline: no AWS calls, network, ssh or real SSM
+session. They cover the code in `src/` (option parsing, shell escaping, the
+resolve cache, rsync flag assembly, PTY/sentinel parsing over pipes). They also
+run the remote shell commands in a local `sh`/`bash`, the Python listener in a
+local `python3` (TCP echo, SIGHUP survival, accept timeout), and the phase 1
+steps against a bash on a real local PTY. `ssm-scp.cr` is the thin script that
+wires it to `aws`/`rsync`.
 
 ## Copyright & License
 

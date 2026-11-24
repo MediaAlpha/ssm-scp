@@ -1,0 +1,10 @@
+version: 2.0
+shards:
+  ameba:
+    git: https://github.com/crystal-ameba/ameba.git
+    version: 1.6.4
+
+  zstd:
+    git: https://github.com/didactic-drunk/zstd.cr.git
+    version: 1.2.0
+

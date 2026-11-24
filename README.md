@@ -6,9 +6,11 @@ An `rsync --rsh` wrapper that tunnels file transfers over [AWS SSM Session Manag
 
 Three phases per transfer:
 
-1. **PTY session** — opens an SSM shell session, configures it, and starts a one-shot Python TCP listener that will `exec` `rsync --server` on the first connection.
+1. **PTY session** — opens an SSM shell session, configures it, and starts a one-shot Python TCP listener that runs `rsync --server` on the first connection. The session stays open for the whole transfer.
 2. **Port forward** — opens a second SSM session (`AWS-StartPortForwardingSession`) to create a clean TCP tunnel from a local port to the remote listener.
 3. **TCP proxy** — bridges `stdin`/`stdout` through the tunnel so the local `rsync` process sees a standard binary stream.
+
+Like `ssh`, ssm-scp passes on the remote `rsync`'s exit status and error text: the listener reports both through the PTY session when the transfer ends, and ssm-scp prints the text on stderr and exits with that status. On exit (also on a signal or a crash) it stops both `aws` processes and their `session-manager-plugin` children.
 
 Compression is negotiated by rsync itself (zstd if both sides have rsync ≥ 3.2, zlib otherwise); ssm-scp does not probe for it and only passes `--compress-level`.
 

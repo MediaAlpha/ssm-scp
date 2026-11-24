@@ -44,6 +44,43 @@ describe SsmScp::Remote do
     end
   end
 
+  describe ".check_command readability (run with /bin/sh)" do
+    it "returns 1 for a file that exists but is not readable" do
+      pending!("running as root: chmod 000 does not block root") if LibC.getuid == 0
+      with_tmp_dir do |dir|
+        File.write(dir / "secret", "x")
+        File.chmod(dir / "secret", 0o000)
+        escaped = shell_escape((dir / "secret").to_s)
+        snippet_rc(SsmScp::Remote.check_command(escaped, false, SPEC_TOKEN), SYS_PATH).should eq 1
+      end
+    end
+
+    it "returns 1 if any of several paths is unreadable, 2 if only missing, 0 if all ok" do
+      pending!("running as root: chmod 000 does not block root") if LibC.getuid == 0
+      with_tmp_dir do |dir|
+        File.write(dir / "ok", "x")
+        File.write(dir / "secret", "x")
+        File.chmod(dir / "secret", 0o000)
+        ok, secret, gone = {"ok", "secret", "gone"}.map { |name| shell_escape((dir / name).to_s) }
+        rc = ->(paths : String) { snippet_rc(SsmScp::Remote.check_command(paths, false, SPEC_TOKEN), SYS_PATH) }
+        rc.call("#{ok}").should eq 0
+        rc.call("#{ok} #{secret}").should eq 1
+        rc.call("#{secret} #{gone}").should eq 1
+        rc.call("#{gone} #{secret}").should eq 1
+        rc.call("#{ok} #{gone}").should eq 2
+      end
+    end
+
+    it "expands globs (left unquoted by rsync's escaping)" do
+      with_tmp_dir do |dir|
+        File.write(dir / "a1.txt", "x")
+        File.write(dir / "a2.txt", "x")
+        snippet_rc(SsmScp::Remote.check_command("#{shell_escape(dir.to_s)}/a*.txt", false, SPEC_TOKEN), SYS_PATH).should eq 0
+        snippet_rc(SsmScp::Remote.check_command("#{shell_escape(dir.to_s)}/b*.txt", false, SPEC_TOKEN), SYS_PATH).should eq 2
+      end
+    end
+  end
+
   describe ".preflight_command (run with bash)" do
     bash = Process.find_executable("bash")
 

@@ -51,6 +51,18 @@ module SsmScp
       {scanned - sentinel.bytesize - 8, 0}.max
     end
 
+    # The frame the remote listener writes when rsync is done: `<token>B`,
+    # rsync's stderr text, then `<token><rc>` and a newline (so a split read
+    # cannot truncate a multi-digit rc).  Returns {stderr text, rc} or nil.
+    # Input is raw PTY text; ANSI codes are stripped.
+    def self.result(raw : String, token : String) : {String, Int32}?
+      tok = Regex.escape(token)
+      m = /#{tok}B\n(.*?)#{tok}(\d+)\n/m.match(strip_ansi(raw))
+      return unless m
+      rc = m[2].to_i? || return
+      {m[1].rstrip, rc}
+    end
+
     # `PORT=<digits>` followed by a newline (so a split read cannot yield a
     # truncated port).  Input is raw PTY text; ANSI codes are stripped.
     def self.port(raw : String) : Int32?
@@ -80,7 +92,14 @@ def wait_for_prompt(master : IO::FileDescriptor, timeout : Float64) : {Bool, Str
   acc = IO::Memory.new
   deadline = Time.instant + timeout.seconds
   while Time.instant < deadline
-    chunk = pty_read_chunk(master, 0.2)
+    chunk = begin
+      pty_read_chunk(master, 0.2)
+    rescue ex : SsmScp::Error
+      # The session closed.  Whatever it printed first (e.g. the aws error
+      # text) is the useful part; only raise if there is nothing to show.
+      raise ex if acc.empty?
+      return {false, strip_ansi(acc.to_s).strip}
+    end
     acc.write(chunk) unless chunk.empty?
     return {true, ""} if PROMPT_RE.match(strip_ansi(acc.to_s))
   end
@@ -115,6 +134,26 @@ def read_remote_port(master : IO::FileDescriptor, timeout : Float64) : Int32?
     acc.write(chunk) unless chunk.empty?
     if port = SsmScp::Sentinel.port(acc.to_s)
       return port
+    end
+  end
+  nil
+end
+
+# Reads the PTY until the listener's result frame for `token` arrives.
+# Returns {rsync's stderr text, rc}, or nil on timeout or if the session
+# closed first.
+def read_remote_result(master : IO::FileDescriptor, token : String, timeout : Float64) : {String, Int32}?
+  acc = IO::Memory.new
+  deadline = Time.instant + timeout.seconds
+  while Time.instant < deadline
+    chunk = begin
+      pty_read_chunk(master, 0.2)
+    rescue SsmScp::Error
+      return SsmScp::Sentinel.result(acc.to_s, token)
+    end
+    acc.write(chunk) unless chunk.empty?
+    if res = SsmScp::Sentinel.result(acc.to_s, token)
+      return res
     end
   end
   nil

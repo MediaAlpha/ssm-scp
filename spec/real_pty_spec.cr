@@ -30,7 +30,7 @@ describe "phase 1 against a local shell on a real PTY" do
         read_until_sentinel(master, tok, 5.0).should eq 0
       end
 
-      master.print(SsmScp::Remote.listener_command(false, "cat"))
+      master.print(SsmScp::Remote.listener_command(false, "cat", new_token))
       port = read_remote_port(master, 5.0)
       port.should be_a(Int32)
       if port

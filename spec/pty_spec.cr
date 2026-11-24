@@ -66,6 +66,21 @@ describe SsmScp::Sentinel do
     end
   end
 
+  describe ".result" do
+    it "parses text and rc between the markers, ANSI and CRLF stripped" do
+      SsmScp::Sentinel.result("\e[0mTOKB\r\nhello\r\nworld\r\n\r\nTOK0\r\n", "TOK").should eq({"hello\nworld", 0})
+    end
+
+    it "needs the newline after the digits" do
+      SsmScp::Sentinel.result("TOKB\n\nTOK12", "TOK").should be_nil
+      SsmScp::Sentinel.result("TOKB\n\nTOK12\n", "TOK").should eq({"", 12})
+    end
+
+    it "needs the begin marker" do
+      SsmScp::Sentinel.result("TOK5\n", "TOK").should be_nil
+    end
+  end
+
   describe ".port" do
     it "parses PORT=n followed by a newline" do
       SsmScp::Sentinel.port("PORT=41234\r\n").should eq 41234
@@ -158,10 +173,20 @@ describe "PTY read helpers" do
       w.close
     end
 
-    it "raises if the session closes while waiting" do
+    it "raises if the session closes while waiting and printed nothing" do
       r, w = IO.pipe
       w.close
       expect_raises(SsmScp::Error, /closed unexpectedly/) { wait_for_prompt(r, 1.0) }
+      r.close
+    end
+
+    it "returns what the session printed when it closes without a prompt" do
+      r, w = IO.pipe
+      w << "\r\nAn error occurred (TargetNotConnected) when calling the StartSession operation: i-0 is not connected.\r\n"
+      w.close
+      ok, text = wait_for_prompt(r, 1.0)
+      ok.should be_false
+      text.should eq "An error occurred (TargetNotConnected) when calling the StartSession operation: i-0 is not connected."
       r.close
     end
   end
@@ -228,6 +253,56 @@ describe "PTY read helpers" do
       w.close
       expect_raises(SsmScp::Error) { read_until_sentinel(r, "TOK", 1.0) }
       r.close
+    end
+  end
+
+  describe "read_remote_result" do
+    it "returns the stderr text and rc of the awaited token" do
+      r, w = IO.pipe
+      w << "[1]+ noise\r\nTOKB\r\nrsync: mkstemp failed: Permission denied (13)\r\nrsync error: x (code 23)\r\n\r\nTOK23\r\n[1]+ Done\r\n"
+      w.flush
+      read_remote_result(r, "TOK", 1.0).should eq({"rsync: mkstemp failed: Permission denied (13)\nrsync error: x (code 23)", 23})
+      r.close
+      w.close
+    end
+
+    it "waits for the newline so a split read cannot truncate the rc" do
+      r, w = IO.pipe
+      spawn do
+        w << "TOKB\r\n\r\nTOK1"
+        w.flush
+        sleep 0.2.seconds
+        w << "27\r\n"
+        w.flush
+      end
+      read_remote_result(r, "TOK", 2.0).should eq({"", 127})
+      r.close
+      w.close
+    end
+
+    it "returns nil on timeout" do
+      r, w = IO.pipe
+      w << "TOKB\r\npartial"
+      w.flush
+      read_remote_result(r, "TOK", 0.3).should be_nil
+      r.close
+      w.close
+    end
+
+    it "returns nil if the session closes first" do
+      r, w = IO.pipe
+      w.close
+      read_remote_result(r, "TOK", 1.0).should be_nil
+      r.close
+    end
+
+    it "is not fooled by an echo of the command line or another token" do
+      r, w = IO.pipe
+      w << "python3 -c \"x\" TOK rsync\r\nOTHERB\r\n\r\nOTHER5\r\n"
+      w.flush
+      read_remote_result(r, "TOK", 0.3).should be_nil
+      r.close
+      w.close
     end
   end
 

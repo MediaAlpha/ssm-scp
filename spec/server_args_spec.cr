@@ -69,8 +69,8 @@ describe SsmScp::ServerArgs do
     end
 
     it "does not add quoting to the listener command either" do
-      cmd = SsmScp::Remote.listener_command(false, "rsync --server -r . /a\\ b")
-      cmd.should end_with " rsync --server -r . /a\\ b 2>/dev/null &\n"
+      cmd = SsmScp::Remote.listener_command(false, "rsync --server -r . /a\\ b", "TOK")
+      cmd.should end_with " TOK rsync --server -r . /a\\ b 2>/dev/null &\n"
       cmd.should_not contain "'sudo'"
     end
   end
@@ -78,12 +78,20 @@ end
 
 describe SsmScp::Remote do
   describe ".check_command" do
-    it "uses plain ls without sudo and reports rc 0/1/2" do
-      cmd = SsmScp::Remote.check_command("/a /b", false, "TOK")
-      cmd.should start_with "if LC_ALL=C ls /a /b >/dev/null 2>&1; then printf 'TOK0\\n'; "
-      cmd.should contain "elif LC_ALL=C ls /a /b 2>&1 | grep -qE 'ermission|sudo:'; then printf 'TOK1\\n'; "
-      cmd.should end_with "else printf 'TOK2\\n'; fi\n"
+    it "tests existence and readability of each (unquoted) path without sudo" do
+      cmd = SsmScp::Remote.check_command("/a /b*", false, "TOK")
+      cmd.should start_with "rc=0; for f in /a /b*; do "
+      cmd.should contain %([ -e "$f" ])
+      cmd.should contain %([ -r "$f" ])
+      cmd.should end_with %(printf '%s%s\\n' 'TOK' "$rc"\n)
       cmd.should_not contain "sudo -n"
+      cmd.should_not contain "TOK0"
+    end
+
+    it "keeps the sudo -n ls probe with sudo and reports rc 0/1/2" do
+      cmd = SsmScp::Remote.check_command("/a /b", true, "TOK")
+      cmd.should start_with "if sudo -n env LC_ALL=C ls /a /b >/dev/null 2>&1; then printf 'TOK0\\n'; "
+      cmd.should end_with "else printf 'TOK2\\n'; fi\n"
     end
 
     it "uses sudo -n (fail fast, no password prompt) with --sudo in both probes, in the C locale" do
@@ -93,7 +101,8 @@ describe SsmScp::Remote do
     end
 
     it "always lists in the C locale so the 'ermission' match is locale independent" do
-      SsmScp::Remote.check_command("/a", false, "TOK").scan("LC_ALL=C ls").size.should eq 2
+      SsmScp::Remote.check_command("/a", false, "TOK").should contain "LC_ALL=C ls"
+      SsmScp::Remote.check_command("/a", true, "TOK").scan("LC_ALL=C ls").size.should eq 2
     end
   end
 
@@ -118,13 +127,13 @@ describe SsmScp::Remote do
 
   describe ".listener_command" do
     it "wraps the python listener in double quotes and backgrounds it" do
-      cmd = SsmScp::Remote.listener_command(false, "rsync --server .")
-      cmd.should start_with %(python3 -c "#{PYTHON_LISTENER}" rsync --server .)
+      cmd = SsmScp::Remote.listener_command(false, "rsync --server .", "TOK")
+      cmd.should start_with %(python3 -c "#{PYTHON_LISTENER}" TOK rsync --server .)
       cmd.should end_with " 2>/dev/null &\n"
     end
 
     it "prefixes sudo" do
-      SsmScp::Remote.listener_command(true, "rsync --server .").should contain %(" 'sudo' '-n' rsync --server .)
+      SsmScp::Remote.listener_command(true, "rsync --server .", "TOK").should contain %(" TOK 'sudo' '-n' rsync --server .)
     end
 
     it "the python listener has no double quote or shell-special characters" do
@@ -132,6 +141,8 @@ describe SsmScp::Remote do
         script.should_not contain "\""
         script.should_not contain "$"
         script.should_not contain "`"
+        script.should_not contain "\\"
+        script.should_not contain "!"
       end
     end
 
@@ -143,7 +154,7 @@ describe SsmScp::Remote do
     end
 
     it "the accept timeout is injectable" do
-      cmd = SsmScp::Remote.listener_command(false, "cat", 3)
+      cmd = SsmScp::Remote.listener_command(false, "cat", "TOK", 3)
       cmd.should contain "s.settimeout(3);"
       cmd.should_not contain "ACCEPT_TIMEOUT"
     end

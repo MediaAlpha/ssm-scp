@@ -35,14 +35,31 @@ module SsmScp
 
   module Remote
     # rc 0 = accessible, 1 = permission denied (or sudo needs a password),
-    # 2 = not found.  `sudo -n` fails at once instead of waiting for a
-    # password on a PTY nobody can type into; LC_ALL=C keeps the 'ermission'
-    # match independent of the remote locale.
+    # 2 = not found.  LC_ALL=C keeps the 'ermission' match independent of the
+    # remote locale.
+    #
+    # Without sudo each path is tested with `[ -e ]`/`[ -r ]`: `ls` succeeds
+    # for a file that exists but cannot be read.  The paths stay unquoted in
+    # the `for` list so globs and rsync's backslash escapes work; inside the
+    # loop "$f" is one concrete name.  A path that fails `-e` may be missing or
+    # sit in an unsearchable directory, so `ls` tells the two apart.
+    # With sudo, `sudo -n` fails at once instead of waiting for a password on
+    # a PTY nobody can type into.
+    # The rc is added by printf so the echoed command line never contains
+    # token+digit (echo cannot fake success).
     def self.check_command(paths_escaped : String, sudo : Bool, token : String) : String
-      ls_cmd = sudo ? "sudo -n env LC_ALL=C ls" : "LC_ALL=C ls"
-      "if #{ls_cmd} #{paths_escaped} >/dev/null 2>&1; then printf '#{token}0\\n'; " \
-      "elif #{ls_cmd} #{paths_escaped} 2>&1 | grep -qE 'ermission|sudo:'; then printf '#{token}1\\n'; " \
-      "else printf '#{token}2\\n'; fi\n"
+      if sudo
+        ls_cmd = "sudo -n env LC_ALL=C ls"
+        "if #{ls_cmd} #{paths_escaped} >/dev/null 2>&1; then printf '#{token}0\\n'; " \
+        "elif #{ls_cmd} #{paths_escaped} 2>&1 | grep -qE 'ermission|sudo:'; then printf '#{token}1\\n'; " \
+        "else printf '#{token}2\\n'; fi\n"
+      else
+        "rc=0; for f in #{paths_escaped}; do " \
+        "if [ -e \"$f\" ]; then [ -r \"$f\" ] || rc=1; " \
+        "elif LC_ALL=C ls -d -- \"$f\" 2>&1 | grep -q 'ermission'; then rc=1; " \
+        "elif [ \"$rc\" = 0 ]; then rc=2; fi; done; " \
+        "printf '%s%s\\n' '#{token}' \"$rc\"\n"
+      end
     end
 
     # rc -1 means the sentinel never arrived (timeout).
@@ -60,10 +77,13 @@ module SsmScp
       PYTHON_LISTENER_TEMPLATE.sub("ACCEPT_TIMEOUT", accept_timeout.to_s)
     end
 
-    def self.listener_command(sudo : Bool, rsync_args_escaped : String,
+    # `token` is passed to the listener as argv[1]; it frames the remote
+    # rsync's stderr and exit code (see PYTHON_LISTENER_TEMPLATE).  The
+    # listener's own stderr is dropped; the rsync's stderr is relayed by it.
+    def self.listener_command(sudo : Bool, rsync_args_escaped : String, token : String,
                               accept_timeout : Int32 | Float64 = LISTENER_ACCEPT_TIMEOUT) : String
       sudo_prefix = sudo ? "'sudo' '-n' " : ""
-      "python3 -c \"#{python_listener(accept_timeout)}\" #{sudo_prefix}#{rsync_args_escaped} 2>/dev/null &\n"
+      "python3 -c \"#{python_listener(accept_timeout)}\" #{token} #{sudo_prefix}#{rsync_args_escaped} 2>/dev/null &\n"
     end
 
     # One round trip: quiet the shell, then check for rsync and python3.

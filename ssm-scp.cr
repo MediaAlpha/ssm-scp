@@ -52,9 +52,12 @@ module Cfg
   class_property? verbose = false
 end
 
-# Child processes to stop when we bail out through `die`.
+# Child processes to stop when we leave, however we leave.  Each `aws`
+# process runs `session-manager-plugin` as its own child, so the whole tree
+# is stopped (SIGTERM, then SIGKILL for what ignores it).  Idempotent.
 module Cleanup
   @@procs = [] of Process
+  class_property? stopping = false
 
   def self.register(proc : Process) : Process
     @@procs << proc
@@ -62,17 +65,30 @@ module Cleanup
   end
 
   def self.run : Nil
-    @@procs.each do |proc|
-      proc.terminate
+    procs = @@procs.dup
+    @@procs.clear
+    procs.each do |proc|
+      next unless proc.exists?
+      SsmScp::ProcTree.kill_tree(proc.pid) { |pid| pid == proc.pid ? proc.exists? : Process.exists?(pid) }
     rescue
       nil
     end
   end
 end
 
+# Also covers crashes (an uncaught exception, e.g. EPIPE on STDERR when our
+# output is piped into `head`) and every `exit`.
+at_exit { Cleanup.run }
+
+# By default Crystal calls libc `exit 141` on EPIPE for stdout/stderr, which
+# skips `at_exit` and would leave the aws processes running.  Raise instead.
+STDOUT.exit_on_broken_pipe = false
+STDERR.exit_on_broken_pipe = false
+
 # Stop our child processes and exit with the conventional 128+signal code.
 {% for sig in [:INT, :TERM, :HUP] %}
   Signal::{{ sig.id }}.trap do
+    Cleanup.stopping = true
     Cleanup.run
     exit 128 + Signal::{{ sig.id }}.value
   end
@@ -182,7 +198,7 @@ end
 
 master, slave_io = guarded { SsmScp.open_pty }
 
-pty_process = Cleanup.register(Process.new("aws", args: aws_args,
+Cleanup.register(Process.new("aws", args: aws_args,
   input: slave_io, output: slave_io, error: slave_io))
 slave_io.close
 
@@ -239,7 +255,8 @@ end
 # accept(); we read the port back through the PTY using read_remote_port.
 # SIGHUP is set to SIG_IGN before execvp so rsync survives the PTY closing.
 STDERR.print "ssm-scp: starting remote listener#{use_sudo ? " (sudo)" : ""} ..."
-master.print(SsmScp::Remote.listener_command(use_sudo, rsync_args_escaped))
+run_tok = new_token
+master.print(SsmScp::Remote.listener_command(use_sudo, rsync_args_escaped, run_tok))
 remote_port = guarded { read_remote_port(master, PORT_TIMEOUT) } || die "timed out waiting for remote rsync port"
 STDERR.puts " port #{remote_port}"
 
@@ -304,9 +321,8 @@ end
 die "port-forward tunnel did not establish within #{FWD_TIMEOUT.to_i}s#{fwd_stderr(fwd_err)}" unless sock
 STDERR.puts " ready"
 
-# Python has accepted the connection and exec'd rsync; PTY session is no longer needed.
-master.close rescue nil
-pty_process.terminate rescue nil
+# The PTY session stays open: the listener reports rsync's stderr and exit
+# code through it once the transfer is over.
 
 # ── Phase 3: TCP proxy ────────────────────────────────────────────────────────
 
@@ -356,4 +372,25 @@ end
 
 2.times { done.receive }
 tcp.close rescue nil
+
+# A signal handler is shutting us down (it exits with 128+signal): leave the
+# exit to it instead of racing it with the "no exit status" path below.
+sleep if Cleanup.stopping?
+
+# Like ssh, hand rsync the remote exit code and the remote stderr text.
+remote_rc = 0
+result = begin
+  read_remote_result(master, run_tok, RESULT_TIMEOUT)
+rescue
+  nil
+end
+sleep if Cleanup.stopping?
+if result
+  text, remote_rc = result
+  STDERR.puts text unless text.empty?
+else
+  STDERR.puts "ssm-scp: warning: no exit status from the remote rsync (assuming success)"
+end
+master.close rescue nil
 Cleanup.run
+exit remote_rc
